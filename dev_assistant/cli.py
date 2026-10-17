@@ -1,4 +1,4 @@
-"""CLI entry point for indexing, /help conversations, and local review."""
+"""CLI entry point for indexing, /help conversations, file tasks, and review."""
 
 from __future__ import annotations
 
@@ -11,9 +11,13 @@ from pathlib import Path
 from .chunking import CHUNKING_VERSION, build_corpus, corpus_fingerprint
 from .deepseek import answer
 from .env import load_local_env
+from .agent_loop import run_file_agent
 from .mcp_client import MCPClient
 from .ollama import embed
 from .storage import RETRIEVAL_VERSION, build_index, write_chunks_jsonl
+
+
+_WRITE_TOOLS = frozenset({"write_file", "apply_patch"})
 
 
 def assistant_root() -> Path:
@@ -145,6 +149,51 @@ def review_command(
     return result
 
 
+class _ReadOnlyMCPClient:
+    """MCP client facade that makes the read-only file mode enforceable.
+
+    The agent's prompt says that a search is read-only, but prompts are not a
+    security boundary.  This facade removes write tools from the advertised
+    schema and rejects them again if a model nevertheless requests one.
+    """
+
+    def __init__(self, project_root: Path):
+        self._client = MCPClient(project_root)
+
+    def __enter__(self):
+        self._client.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._client.__exit__(*args)
+
+    def list_tools(self) -> list[dict]:
+        return [tool for tool in self._client.list_tools() if tool.get("name") not in _WRITE_TOOLS]
+
+    def call_tool(self, name: str, arguments: dict | None = None) -> dict:
+        if name in _WRITE_TOOLS:
+            raise RuntimeError("read-only mode prohibits file modifications")
+        return self._client.call_tool(name, arguments)
+
+
+def files_command(goal: str, project_root: Path, *, read_only: bool = False) -> str:
+    """Run the bounded MCP file agent for a user-described goal.
+
+    File work is deliberately kept separate from the RAG ``help`` command:
+    the agent discovers files and performs any requested edits only through
+    the allow-listed MCP tools.  ``AgentReport.render`` is the stable human
+    output contract (answer, files read/changed, and final diff).
+    """
+    if read_only:
+        with _ReadOnlyMCPClient(project_root) as mcp:
+            report = run_file_agent(goal, project_root, mcp_client=mcp, scenario="search")
+    else:
+        report = run_file_agent(goal, project_root)
+    rendered = report.render() if hasattr(report, "render") else str(report)
+    print(rendered)
+    return rendered
+
+
 def main() -> None:
     load_local_env(assistant_root())
     parser = argparse.ArgumentParser(description="Standalone RAG developer assistant")
@@ -167,6 +216,17 @@ def main() -> None:
     review_parser.add_argument("--working-tree", action="store_true", help="review uncommitted working-tree changes")
     review_parser.add_argument("--output", type=Path, help="also write the review report as UTF-8 text")
     review_parser.add_argument("--reindex", action="store_true", default=argparse.SUPPRESS, help="rebuild the RAG index first")
+    files_parser = subparsers.add_parser(
+        "files",
+        help="выполнить пользовательскую цель через безопасные MCP-инструменты файлового агента",
+    )
+    files_parser.add_argument("goal", nargs="+", help="цель на естественном языке, например поиск использований API")
+    files_parser.add_argument("--project-root", type=Path, dest="project_root", default=argparse.SUPPRESS)
+    files_parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="запретить запись файлов (режим поиска и анализа)",
+    )
     args = parser.parse_args()
     root = (args.project_root or default_project_root()).expanduser().resolve()
     output_root = assistant_root()
@@ -187,9 +247,17 @@ def main() -> None:
             output=args.output,
             reindex=getattr(args, "reindex", False),
         )
+    elif args.command == "files":
+        if args.read_only:
+            files_command(" ".join(args.goal), root, read_only=True)
+        else:
+            files_command(" ".join(args.goal), root)
     else:
-        ensure_index(root, output_root, reindex=args.reindex)
-        print("Введите /help <вопрос>. Ctrl-D завершает работу.")
+        print(
+            "Введите /help <вопрос>, /files <цель> (может менять файлы) "
+            "или /files-read <цель> (только чтение). Ctrl-D завершает работу."
+        )
+        index_checked = False
         for line in sys.stdin:
             command = line.strip()
             if not command:
@@ -199,8 +267,28 @@ def main() -> None:
                 continue
             if command.startswith("/help "):
                 try:
+                    if not index_checked:
+                        ensure_index(root, output_root, reindex=args.reindex)
+                        index_checked = True
                     help_command(command[6:].strip(), root, output_root)
                 except Exception as exc:
                     print(f"Ошибка: {exc}")
+                continue
+            if command == "/files" or command == "/files-read":
+                suffix = "-read" if command.endswith("-read") else ""
+                print(f"Использование: /files{suffix} <цель>")
+                continue
+            if command.startswith("/files-read "):
+                try:
+                    files_command(command[len("/files-read "):].strip(), root, read_only=True)
+                except Exception as exc:
+                    print(f"Ошибка: {exc}")
+                continue
+            if command.startswith("/files "):
+                try:
+                    files_command(command[len("/files "):].strip(), root)
+                except Exception as exc:
+                    print(f"Ошибка: {exc}")
+                continue
             else:
-                print("Поддерживается команда /help <вопрос>")
+                print("Поддерживаются /help <вопрос>, /files <цель> и /files-read <цель>")

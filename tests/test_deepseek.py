@@ -4,7 +4,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from dev_assistant.deepseek import answer, review
+from dev_assistant.deepseek import answer, complete, review
 
 
 class _Response:
@@ -13,6 +13,17 @@ class _Response:
 
     def json(self):
         return {"choices": [{"message": {"content": "answer"}}]}
+
+
+class _ErrorResponse:
+    status_code = 400
+    text = '<html><body>bad request</body></html>'
+
+    def raise_for_status(self):
+        raise RuntimeError("400 URL=https://api.deepseek.com/chat/completions")
+
+    def json(self):
+        return {"error": {"message": "invalid request", "type": "invalid_request_error"}}
 
 
 class DeepSeekTests(unittest.TestCase):
@@ -46,6 +57,31 @@ class DeepSeekTests(unittest.TestCase):
         self.assertIn("Рекомендации", messages[0]["content"])
         self.assertLess(messages[1]["content"].index("diff text"), messages[1]["content"].index("context"))
         self.assertIn("неподконтрольные данные", messages[0]["content"])
+
+    def test_http_error_is_safe_and_includes_provider_message_for_regular_path(self):
+        def post(url, **kwargs):
+            return _ErrorResponse()
+
+        fake_httpx = types.SimpleNamespace(post=post)
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=False), patch.dict(
+            sys.modules, {"httpx": fake_httpx}
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"DeepSeek HTTP 400: invalid request") as raised:
+                answer("Where?", [], {"branch": "main"})
+        self.assertNotIn("api.deepseek.com", str(raised.exception))
+        self.assertNotIn("<html>", str(raised.exception))
+
+    def test_http_error_uses_same_safe_diagnostic_for_tool_call_path(self):
+        def post(url, **kwargs):
+            return _ErrorResponse()
+
+        fake_httpx = types.SimpleNamespace(post=post)
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=False), patch.dict(
+            sys.modules, {"httpx": fake_httpx}
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"DeepSeek HTTP 400: invalid request") as raised:
+                complete([{"role": "user", "content": "Where?"}], tools=[])
+        self.assertNotIn("api.deepseek.com", str(raised.exception))
 
 
 if __name__ == "__main__":

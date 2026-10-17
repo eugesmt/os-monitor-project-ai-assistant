@@ -24,7 +24,10 @@ class MCPProtocolTests(unittest.TestCase):
 
             self.assertEqual(call({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})["result"]["serverInfo"]["name"], "taskmanager-developer-assistant")
             tools = call({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})["result"]["tools"]
-            self.assertEqual([tool["name"] for tool in tools], ["get_git_branch"])
+            self.assertEqual(
+                [tool["name"] for tool in tools],
+                ["get_git_branch", "list_files", "read_file", "search_text", "write_file", "apply_patch", "get_diff"],
+            )
             result = call({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "get_git_branch", "arguments": {}}})
             self.assertEqual(result["result"]["structuredContent"]["branch"], "test-branch")
             process.terminate()

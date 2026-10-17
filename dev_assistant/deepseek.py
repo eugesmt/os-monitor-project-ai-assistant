@@ -4,6 +4,60 @@ from __future__ import annotations
 
 import json
 import os
+import re
+
+
+_PROVIDER_MESSAGE_LIMIT = 400
+_SECRET_RE = re.compile(
+    r"(?i)(authorization|api[-_ ]?key|token|password)\s*[:=]\s*[^\s,;]+|bearer\s+[^\s,;]+"
+)
+_HTML_RE = re.compile(r"<[^>]{0,200}>")
+
+
+def _safe_provider_message(response: object) -> str:
+    """Extract a short, body-only provider message without leaking secrets."""
+    payload: object | None = None
+    try:
+        payload = response.json()  # type: ignore[attr-defined]
+    except Exception:
+        payload = None
+
+    message: object | None = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("detail") or error.get("type")
+        elif isinstance(error, str):
+            message = error
+        message = message or payload.get("message") or payload.get("detail")
+    elif isinstance(payload, str):
+        message = payload
+
+    if message is None:
+        try:
+            message = getattr(response, "text", "")
+        except Exception:
+            message = ""
+    rendered = re.sub(r"\s+", " ", str(message or "")).strip()
+    # A complete HTML page is neither useful nor safe to echo.  For snippets,
+    # remove tags while retaining a concise textual provider message.
+    if "<html" in rendered.lower() or "<!doctype" in rendered.lower():
+        rendered = "HTML error response"
+    else:
+        rendered = _HTML_RE.sub(" ", rendered)
+    rendered = _SECRET_RE.sub("[REDACTED]", rendered)
+    rendered = re.sub(r"\s+", " ", rendered).strip()
+    return rendered[:_PROVIDER_MESSAGE_LIMIT]
+
+
+def _raise_for_status(response: object) -> None:
+    """Raise a stable provider error instead of exposing httpx's URL error."""
+    try:
+        response.raise_for_status()  # type: ignore[attr-defined]
+    except Exception as exc:
+        status = getattr(response, "status_code", "unknown")
+        detail = _safe_provider_message(response) or "provider returned an error"
+        raise RuntimeError(f"DeepSeek HTTP {status}: {detail}") from exc
 
 
 def _complete(messages: list[dict]) -> str:
@@ -28,11 +82,46 @@ def _complete(messages: list[dict]) -> str:
         json={"model": model, "messages": messages, "temperature": 0.1},
         timeout=120.0,
     )
-    response.raise_for_status()
+    _raise_for_status(response)
     choices = response.json().get("choices", [])
     if not choices or not choices[0].get("message", {}).get("content"):
         raise ValueError("DeepSeek returned no answer")
     return str(choices[0]["message"]["content"]).strip()
+
+
+def complete(messages: list[dict], tools: list[dict] | None = None) -> dict:
+    """Return a raw chat-completion message, optionally with tool calls.
+
+    The regular :func:`answer` and :func:`review` helpers intentionally return
+    plain text.  File-agent orchestration needs the provider's structured
+    ``tool_calls`` field, so it uses this small public adapter instead.  The
+    returned value is the OpenAI-compatible ``message`` object and therefore
+    remains easy to replace with a deterministic test model.
+    """
+    try:
+        import httpx
+    except ImportError as exc:
+        raise RuntimeError("install requirements.txt before using DeepSeek") from exc
+    key = os.getenv("DEEPSEEK_API_KEY")
+    if not key:
+        raise RuntimeError("DEEPSEEK_API_KEY is not set")
+    base = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    payload: dict = {"model": model, "messages": messages, "temperature": 0.1}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    response = httpx.post(
+        base + "/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json=payload,
+        timeout=120.0,
+    )
+    _raise_for_status(response)
+    choices = response.json().get("choices", [])
+    if not choices or not isinstance(choices[0].get("message"), dict):
+        raise ValueError("DeepSeek returned no message")
+    return choices[0]["message"]
 
 
 def answer(question: str, sources: list[dict], branch: dict) -> str:

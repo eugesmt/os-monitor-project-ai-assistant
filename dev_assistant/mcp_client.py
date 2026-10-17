@@ -55,3 +55,15 @@ class MCPClient:
         result = self.call("tools/call", {"name": "get_git_branch", "arguments": {}})
         assert result is not None
         return result["structuredContent"]
+
+    def list_tools(self) -> list[dict]:
+        """Return the tools advertised by the configured MCP server."""
+        result = self.call("tools/list", {})
+        assert result is not None
+        return result.get("tools", [])
+
+    def call_tool(self, name: str, arguments: dict | None = None) -> dict:
+        """Call one advertised MCP tool and return its result envelope."""
+        result = self.call("tools/call", {"name": name, "arguments": arguments or {}})
+        assert result is not None
+        return result
